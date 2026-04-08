@@ -64,22 +64,53 @@ def documents_table_exists():
 
 
 def import_documents(uploaded_file):
-    df = pd.read_csv(uploaded_file)
-    if "m_id" not in df.columns:
+    incoming = pd.read_csv(uploaded_file)
+    if "m_id" not in incoming.columns:
         raise ValueError("The uploaded CSV must include an 'm_id' column.")
 
-    df = df.copy()
-    df["m_id"] = df["m_id"].astype(str)
-    df = df.drop_duplicates(subset="m_id", keep="first").reset_index(drop=True)
+    incoming = incoming.copy()
+    incoming["m_id"] = incoming["m_id"].astype(str)
+    incoming = incoming.drop_duplicates(subset="m_id", keep="first").reset_index(drop=True)
 
-    if "label" in df.columns:
-        df = df.drop(columns=["label"])
+    if "label" in incoming.columns:
+        incoming = incoming.drop(columns=["label"])
 
-    df.insert(0, "source_order", range(1, len(df) + 1))
-    df["label"] = pd.NA
+    existing = load_documents()
+    if existing.empty:
+        incoming.insert(0, "source_order", range(1, len(incoming) + 1))
+        incoming["label"] = pd.NA
+        with get_connection() as conn:
+            incoming.to_sql(DOCUMENTS_TABLE, conn, if_exists="replace", index=False)
+        return len(incoming)
+
+    existing_ids = set(existing["m_id"].astype(str))
+    new_docs = incoming[~incoming["m_id"].isin(existing_ids)].copy()
+    if new_docs.empty:
+        return 0
+
+    next_source_order = int(existing["source_order"].max()) + 1
+    new_docs.insert(0, "source_order", range(next_source_order, next_source_order + len(new_docs)))
+    new_docs["label"] = pd.NA
+
+    all_columns = list(existing.columns)
+    for column in new_docs.columns:
+        if column not in all_columns:
+            all_columns.append(column)
+            existing[column] = pd.NA
+
+    for column in all_columns:
+        if column not in new_docs.columns:
+            new_docs[column] = pd.NA
+
+    combined = pd.concat(
+        [existing[all_columns], new_docs[all_columns]],
+        ignore_index=True,
+    )
 
     with get_connection() as conn:
-        df.to_sql(DOCUMENTS_TABLE, conn, if_exists="replace", index=False)
+        combined.to_sql(DOCUMENTS_TABLE, conn, if_exists="replace", index=False)
+
+    return len(new_docs)
 
 
 def load_documents():
@@ -170,8 +201,11 @@ if upload_submitted:
         st.sidebar.error("Choose a CSV file before loading.")
     else:
         try:
-            import_documents(uploaded_file)
-            st.sidebar.success("CSV loaded into SQLite.")
+            inserted_count = import_documents(uploaded_file)
+            if inserted_count == 0:
+                st.sidebar.info("No new documents were added.")
+            else:
+                st.sidebar.success(f"Added {inserted_count} new documents to SQLite.")
             st.rerun()
         except Exception as exc:
             st.sidebar.error(str(exc))
