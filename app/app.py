@@ -1,50 +1,18 @@
-import streamlit as st
-import pandas as pd
-import os
 import html
 import hmac
+import sqlite3
 from pathlib import Path
+
+import pandas as pd
+import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = APP_DIR.parent
-DATA_PATH = PROJECT_DIR / "data" / "to_annotate.csv"
-LABELS_PATH = PROJECT_DIR / "labeled" / "labels.csv"
+DATABASE_PATH = PROJECT_DIR / "annotatr.db"
+DOCUMENTS_TABLE = "documents"
 
 st.set_page_config(page_title="AnnotaTR", layout="wide")
-
-LABELS_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-
-@st.cache_data
-def load_data():
-    df = pd.read_csv(DATA_PATH)
-    df["m_id"] = df["m_id"].astype(str)
-    return df.drop_duplicates(subset="m_id", keep="first")
-
-
-def load_labels():
-    if os.path.exists(LABELS_PATH):
-        labels = pd.read_csv(LABELS_PATH, index_col=0)
-        labels.index = labels.index.astype(str)
-        labels.index.name = "m_id"
-        return labels[~labels.index.duplicated(keep="last")]
-    return pd.DataFrame(columns=["label"], index=pd.Index([], name="m_id"))
-
-
-def save_label(doc, label):
-    labels = load_labels()
-    doc_id = str(doc["m_id"])
-    row_to_save = doc.copy()
-    row_to_save["m_id"] = doc_id
-    row_to_save["label"] = label
-
-    for column in row_to_save.index:
-        if column not in labels.columns:
-            labels[column] = pd.NA
-
-    labels.loc[doc_id, row_to_save.index.tolist()] = row_to_save.values
-    labels.to_csv(LABELS_PATH)
 
 
 def get_auth_credentials():
@@ -82,17 +50,84 @@ def login_required():
     return False
 
 
-def get_unlabeled_docs(df, labels):
-    labeled_ids = set(labels.index.tolist())
-    return df[~df["m_id"].isin(labeled_ids)]
+def get_connection():
+    return sqlite3.connect(DATABASE_PATH)
 
 
-def get_next_doc(unlabeled):
+def documents_table_exists():
+    with get_connection() as conn:
+        result = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (DOCUMENTS_TABLE,),
+        ).fetchone()
+    return result is not None
+
+
+def import_documents(uploaded_file):
+    df = pd.read_csv(uploaded_file)
+    if "m_id" not in df.columns:
+        raise ValueError("The uploaded CSV must include an 'm_id' column.")
+
+    df = df.copy()
+    df["m_id"] = df["m_id"].astype(str)
+    df = df.drop_duplicates(subset="m_id", keep="first").reset_index(drop=True)
+
+    if "label" in df.columns:
+        df = df.drop(columns=["label"])
+
+    df.insert(0, "source_order", range(1, len(df) + 1))
+    df["label"] = pd.NA
+
+    with get_connection() as conn:
+        df.to_sql(DOCUMENTS_TABLE, conn, if_exists="replace", index=False)
+
+
+def load_documents():
+    if not documents_table_exists():
+        return pd.DataFrame()
+
+    with get_connection() as conn:
+        df = pd.read_sql_query(
+            f"SELECT * FROM {DOCUMENTS_TABLE} ORDER BY source_order",
+            conn,
+        )
+
+    if "m_id" in df.columns:
+        df["m_id"] = df["m_id"].astype(str)
+    return df
+
+
+def save_label(doc_id, label):
+    with get_connection() as conn:
+        conn.execute(
+            f"UPDATE {DOCUMENTS_TABLE} SET label = ? WHERE m_id = ?",
+            (label, str(doc_id)),
+        )
+        conn.commit()
+
+
+def get_next_doc(documents):
+    if documents.empty:
+        return None, None
+
+    unlabeled = documents[documents["label"].isna() | (documents["label"] == "")]
     if unlabeled.empty:
         return None, None
+
     doc = unlabeled.iloc[0]
-    doc_id = doc["m_id"]
-    return doc_id, doc
+    return doc["m_id"], doc
+
+
+def get_labeled_export():
+    documents = load_documents()
+    if documents.empty:
+        return None
+
+    labeled = documents[documents["label"].notna() & (documents["label"] != "")]
+    if labeled.empty:
+        return None
+
+    return labeled.to_csv(index=False).encode("utf-8")
 
 
 def render_text_block(kind, text):
@@ -124,72 +159,100 @@ if not login_required():
     st.stop()
 
 
-# --- Load data ---
-df = load_data()
-labels = load_labels()
-unlabeled = get_unlabeled_docs(df, labels)
-
-total = len(df)
-remaining = len(unlabeled)
-done = total - remaining
-progress_value = min(max(done / total, 0.0), 1.0) if total > 0 else 0.0
-
-# --- Sidebar progress ---
 st.sidebar.title("AnnotaTR")
+
+with st.sidebar.form("upload_form"):
+    uploaded_file = st.file_uploader("Upload documents CSV", type="csv")
+    upload_submitted = st.form_submit_button("Load CSV", use_container_width=True)
+
+if upload_submitted:
+    if uploaded_file is None:
+        st.sidebar.error("Choose a CSV file before loading.")
+    else:
+        try:
+            import_documents(uploaded_file)
+            st.sidebar.success("CSV loaded into SQLite.")
+            st.rerun()
+        except Exception as exc:
+            st.sidebar.error(str(exc))
+
+documents = load_documents()
+
+total = len(documents)
+remaining = 0
+done = 0
+progress_value = 0.0
+
+if total > 0:
+    remaining = int((documents["label"].isna() | (documents["label"] == "")).sum())
+    done = total - remaining
+    progress_value = done / total
+
 st.sidebar.metric("Remaining", remaining)
 st.sidebar.progress(progress_value)
 st.sidebar.caption(f"{done} of {total} documents classified")
-if st.sidebar.button("Log out"):
+
+export_bytes = get_labeled_export()
+st.sidebar.download_button(
+    "Download labeled CSV",
+    data=export_bytes or b"",
+    file_name="labeled_documents.csv",
+    mime="text/csv",
+    disabled=export_bytes is None,
+    use_container_width=True,
+)
+
+if st.sidebar.button("Log out", use_container_width=True):
     st.session_state["authenticated"] = False
     st.rerun()
 
-if st.sidebar.button("Reload data"):
-    st.cache_data.clear()
+if st.sidebar.button("Reload data", use_container_width=True):
     st.rerun()
 
-# --- Main area ---
 st.title("Document Classification")
 
-doc_id, doc = get_next_doc(unlabeled)
+if documents.empty:
+    st.info("Upload a CSV file with an 'm_id' column to start labeling.")
+    st.stop()
+
+doc_id, doc = get_next_doc(documents)
 
 if doc is None:
     st.success("All documents have been classified!")
     st.balloons()
-else:
+    st.stop()
 
-    st.divider()
-    st.subheader("Your classification")
+st.divider()
+st.subheader("Your classification")
 
-    cols = st.columns(4)
-    labels_map = {
-        "True": ("True", "green"),
-        "False": ("False", "red"),
-        "Uncertain": ("Uncertain", "orange"),
-        "Invalid": ("Invalid", "gray"),
-    }
+cols = st.columns(4)
+labels_map = {
+    "True": "True",
+    "False": "False",
+    "Uncertain": "Uncertain",
+    "Invalid": "Invalid",
+}
 
-    for i, (label, (display, _)) in enumerate(labels_map.items()):
-        if cols[i].button(display, key=label, use_container_width=True):
-            save_label(doc, label)
-            st.rerun()
-            
-    st.caption(f"Document ID: `{doc_id}`")
+for i, (key, display) in enumerate(labels_map.items()):
+    if cols[i].button(display, key=key, use_container_width=True):
+        save_label(doc_id, key)
+        st.rerun()
 
-    col1, col2 = st.columns(2)
+st.caption(f"Document ID: `{doc_id}`")
 
-    with col1:
-        st.subheader("Tweet")
-        render_text_block("info", doc.get("t_text", ""))
+col1, col2 = st.columns(2)
 
-        st.subheader("Mention / Query")
-        render_text_block("warning", doc.get("m_text", ""))
+with col1:
+    st.subheader("Tweet")
+    render_text_block("info", doc.get("t_text", ""))
 
-    with col2:
-        st.subheader("LLM Response")
-        render_text_block("success", doc.get("l_text", ""))
+    st.subheader("Mention / Query")
+    render_text_block("warning", doc.get("m_text", ""))
 
-        score = doc.get("l_score", None)
-        if pd.notna(score):
-            st.metric("LLM Score", f"{score:.0f} / 100")
+with col2:
+    st.subheader("LLM Response")
+    render_text_block("success", doc.get("l_text", ""))
 
-    
+    score = doc.get("l_score", None)
+    if pd.notna(score):
+        st.metric("LLM Score", f"{score:.0f} / 100")
