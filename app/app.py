@@ -1,51 +1,32 @@
 import html
-import hmac
 import sqlite3
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from streamlit.errors import StreamlitSecretNotFoundError
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = APP_DIR.parent
 DATABASE_PATH = PROJECT_DIR / "annotatr.db"
 DOCUMENTS_TABLE = "documents"
+ANNOTATIONS_TABLE = "annotations"
+ANNOTATORS = ["Dave", "Thomas", "Mohsen"]
 
 st.set_page_config(page_title="AnnotaTR", layout="wide")
 
 
-def get_auth_credentials():
-    try:
-        username = st.secrets.get("app_username", "test1")
-        password = st.secrets.get("app_password", "test2")
-    except StreamlitSecretNotFoundError:
-        username = "test1"
-        password = "test2"
-    return str(username), str(password)
-
-
-def login_required():
-    expected_username, expected_password = get_auth_credentials()
-
-    if st.session_state.get("authenticated", False):
+def select_annotator():
+    if st.session_state.get("annotator"):
         return True
 
-    st.title("AnnotaTR Login")
-    st.caption("Sign in to access the annotation app.")
+    st.title("AnnotaTR")
+    st.subheader("Who are you?")
 
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login", use_container_width=True)
-
-    if submitted:
-        valid_username = hmac.compare_digest(username, expected_username)
-        valid_password = hmac.compare_digest(password, expected_password)
-        if valid_username and valid_password:
-            st.session_state["authenticated"] = True
+    cols = st.columns(len(ANNOTATORS))
+    for i, name in enumerate(ANNOTATORS):
+        if cols[i].button(name, use_container_width=True, key=f"annotator_{name}"):
+            st.session_state["annotator"] = name
             st.rerun()
-        st.error("Invalid username or password.")
 
     return False
 
@@ -63,6 +44,19 @@ def documents_table_exists():
     return result is not None
 
 
+def ensure_annotations_table():
+    with get_connection() as conn:
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {ANNOTATIONS_TABLE} (
+                m_id TEXT NOT NULL,
+                annotator TEXT NOT NULL,
+                label TEXT NOT NULL,
+                PRIMARY KEY (m_id, annotator)
+            )
+        """)
+        conn.commit()
+
+
 def import_documents(uploaded_file):
     incoming = pd.read_csv(uploaded_file)
     if "m_id" not in incoming.columns:
@@ -72,13 +66,13 @@ def import_documents(uploaded_file):
     incoming["m_id"] = incoming["m_id"].astype(str)
     incoming = incoming.drop_duplicates(subset="m_id", keep="first").reset_index(drop=True)
 
-    if "label" in incoming.columns:
-        incoming = incoming.drop(columns=["label"])
+    for col in ("label", "label_dave", "label_thomas", "label_mohsen"):
+        if col in incoming.columns:
+            incoming = incoming.drop(columns=[col])
 
     existing = load_documents()
     if existing.empty:
         incoming.insert(0, "source_order", range(1, len(incoming) + 1))
-        incoming["label"] = pd.NA
         with get_connection() as conn:
             incoming.to_sql(DOCUMENTS_TABLE, conn, if_exists="replace", index=False)
         return len(incoming)
@@ -90,7 +84,6 @@ def import_documents(uploaded_file):
 
     next_source_order = int(existing["source_order"].max()) + 1
     new_docs.insert(0, "source_order", range(next_source_order, next_source_order + len(new_docs)))
-    new_docs["label"] = pd.NA
 
     all_columns = list(existing.columns)
     for column in new_docs.columns:
@@ -128,20 +121,35 @@ def load_documents():
     return df
 
 
-def save_label(doc_id, label):
+def save_label(doc_id, label, annotator):
+    ensure_annotations_table()
     with get_connection() as conn:
         conn.execute(
-            f"UPDATE {DOCUMENTS_TABLE} SET label = ? WHERE m_id = ?",
-            (label, str(doc_id)),
+            f"""INSERT INTO {ANNOTATIONS_TABLE} (m_id, annotator, label)
+                VALUES (?, ?, ?)
+                ON CONFLICT(m_id, annotator) DO UPDATE SET label = excluded.label""",
+            (str(doc_id), annotator, label),
         )
         conn.commit()
 
 
-def get_next_doc(documents):
+def get_annotator_labeled_ids(annotator):
+    ensure_annotations_table()
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT m_id FROM {ANNOTATIONS_TABLE} WHERE annotator = ?",
+            (annotator,),
+        ).fetchall()
+    return {row[0] for row in rows}
+
+
+def get_next_doc(documents, annotator):
     if documents.empty:
         return None, None
 
-    unlabeled = documents[documents["label"].isna() | (documents["label"] == "")]
+    labeled_ids = get_annotator_labeled_ids(annotator)
+    unlabeled = documents[~documents["m_id"].isin(labeled_ids)]
+
     if unlabeled.empty:
         return None, None
 
@@ -149,16 +157,45 @@ def get_next_doc(documents):
     return doc["m_id"], doc
 
 
-def get_labeled_export():
+def get_annotator_stats(documents, annotator):
+    if documents.empty:
+        return 0, 0, 0.0
+
+    total = len(documents)
+    done = len(get_annotator_labeled_ids(annotator))
+    remaining = total - done
+    progress = done / total if total > 0 else 0.0
+    return remaining, done, progress
+
+
+def get_labeled_export(annotator):
+    ensure_annotations_table()
     documents = load_documents()
     if documents.empty:
         return None
 
-    labeled = documents[documents["label"].notna() & (documents["label"] != "")]
-    if labeled.empty:
+    with get_connection() as conn:
+        annotations_df = pd.read_sql_query(
+            f"SELECT m_id, label FROM {ANNOTATIONS_TABLE} WHERE annotator = ?",
+            conn,
+            params=(annotator,),
+        )
+
+    if annotations_df.empty:
         return None
 
+    labeled = documents.merge(annotations_df, on="m_id", how="inner")
     return labeled.to_csv(index=False).encode("utf-8")
+
+
+def get_all_annotations():
+    ensure_annotations_table()
+    with get_connection() as conn:
+        df = pd.read_sql_query(
+            f"SELECT m_id, annotator, label FROM {ANNOTATIONS_TABLE} ORDER BY m_id, annotator",
+            conn,
+        )
+    return df
 
 
 def render_text_block(kind, text):
@@ -186,11 +223,27 @@ def render_text_block(kind, text):
     )
 
 
-if not login_required():
+@st.dialog("All Annotations", width="large")
+def show_all_annotations():
+    df = get_all_annotations()
+    if df.empty:
+        st.info("No annotations have been saved yet.")
+        return
+
+    pivot = df.pivot_table(index="m_id", columns="annotator", values="label", aggfunc="first")
+    pivot = pivot.reset_index()
+    pivot.columns.name = None
+    st.dataframe(pivot, use_container_width=True)
+    st.caption(f"Total annotations: {len(df)}")
+
+
+if not select_annotator():
     st.stop()
 
+annotator = st.session_state["annotator"]
 
 st.sidebar.title("AnnotaTR")
+st.sidebar.caption(f"Annotating as: **{annotator}**")
 
 with st.sidebar.form("upload_form"):
     uploaded_file = st.file_uploader("Upload documents CSV", type="csv")
@@ -211,22 +264,14 @@ if upload_submitted:
             st.sidebar.error(str(exc))
 
 documents = load_documents()
-
+remaining, done, progress_value = get_annotator_stats(documents, annotator)
 total = len(documents)
-remaining = 0
-done = 0
-progress_value = 0.0
-
-if total > 0:
-    remaining = int((documents["label"].isna() | (documents["label"] == "")).sum())
-    done = total - remaining
-    progress_value = done / total
 
 st.sidebar.metric("Remaining", remaining)
 st.sidebar.progress(progress_value)
 st.sidebar.caption(f"{done} of {total} documents classified")
 
-export_bytes = get_labeled_export()
+export_bytes = get_labeled_export(annotator)
 st.sidebar.download_button(
     "Download labeled CSV",
     data=export_bytes or b"",
@@ -236,8 +281,11 @@ st.sidebar.download_button(
     use_container_width=True,
 )
 
+if st.sidebar.button("View all annotations", use_container_width=True):
+    show_all_annotations()
+
 if st.sidebar.button("Log out", use_container_width=True):
-    st.session_state["authenticated"] = False
+    del st.session_state["annotator"]
     st.rerun()
 
 if st.sidebar.button("Reload data", use_container_width=True):
@@ -249,7 +297,7 @@ if documents.empty:
     st.info("Upload a CSV file with an 'm_id' column to start labeling.")
     st.stop()
 
-doc_id, doc = get_next_doc(documents)
+doc_id, doc = get_next_doc(documents, annotator)
 
 if doc is None:
     st.success("All documents have been classified!")
@@ -269,7 +317,7 @@ labels_map = {
 
 for i, (key, display) in enumerate(labels_map.items()):
     if cols[i].button(display, key=key, use_container_width=True):
-        save_label(doc_id, key)
+        save_label(doc_id, key, annotator)
         st.rerun()
 
 st.caption(f"Document ID: `{doc_id}`")
