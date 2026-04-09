@@ -10,9 +10,44 @@ PROJECT_DIR = APP_DIR.parent
 DATABASE_PATH = PROJECT_DIR / "annotatr.db"
 DOCUMENTS_TABLE = "documents"
 ANNOTATIONS_TABLE = "annotations"
-ANNOTATORS = ["Dave", "Thomas", "Mohsen"]
+ANNOTATORS_TABLE = "annotators"
+DEFAULT_ANNOTATORS = ["Dave", "Thomas", "Mohsen"]
 
 st.set_page_config(page_title="AnnotaTR", layout="wide")
+
+
+def ensure_annotators_table():
+    with get_connection() as conn:
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {ANNOTATORS_TABLE} (
+                name TEXT PRIMARY KEY
+            )
+        """)
+        for name in DEFAULT_ANNOTATORS:
+            conn.execute(
+                f"INSERT OR IGNORE INTO {ANNOTATORS_TABLE} (name) VALUES (?)",
+                (name,),
+            )
+        conn.commit()
+
+
+def load_annotators():
+    ensure_annotators_table()
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT name FROM {ANNOTATORS_TABLE} ORDER BY rowid"
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
+def add_annotator(name):
+    ensure_annotators_table()
+    with get_connection() as conn:
+        conn.execute(
+            f"INSERT OR IGNORE INTO {ANNOTATORS_TABLE} (name) VALUES (?)",
+            (name.strip(),),
+        )
+        conn.commit()
 
 
 def select_annotator():
@@ -22,10 +57,26 @@ def select_annotator():
     st.title("AnnotaTR")
     st.subheader("Who are you?")
 
-    cols = st.columns(len(ANNOTATORS))
-    for i, name in enumerate(ANNOTATORS):
+    annotators = load_annotators()
+    cols = st.columns(len(annotators))
+    for i, name in enumerate(annotators):
         if cols[i].button(name, use_container_width=True, key=f"annotator_{name}"):
             st.session_state["annotator"] = name
+            st.rerun()
+
+    st.divider()
+    with st.form("add_annotator_form", clear_on_submit=True):
+        new_name = st.text_input("Add a new annotator", placeholder="Enter name…")
+        submitted = st.form_submit_button("Add", use_container_width=False)
+
+    if submitted:
+        new_name = new_name.strip()
+        if not new_name:
+            st.error("Please enter a name.")
+        elif new_name in annotators:
+            st.warning(f"**{new_name}** is already in the list.")
+        else:
+            add_annotator(new_name)
             st.rerun()
 
     return False
@@ -335,6 +386,3 @@ with col2:
     st.subheader("LLM Response")
     render_text_block("success", doc.get("l_text", ""))
 
-    score = doc.get("l_score", None)
-    if pd.notna(score):
-        st.metric("LLM Score", f"{score:.0f} / 100")
